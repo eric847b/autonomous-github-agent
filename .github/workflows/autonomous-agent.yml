@@ -35,7 +35,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install openai github3.py pydantic rich
+          pip install openai PyGithub pydantic rich
 
       - name: Run Agent
         env:
