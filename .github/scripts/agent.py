@@ -1,150 +1,101 @@
-import os
-import json
-import subprocess
+import os,json,subprocess
 from pathlib import Path
 from github import Github
 from openai import OpenAI
 
-# --- Clients ---
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-g = Github(os.getenv("GITHUB_TOKEN"))
-repo = g.get_repo(os.getenv("GITHUB_REPOSITORY"))
+client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+gh=Github(os.getenv("GITHUB_TOKEN"))
+repo=gh.get_repo(os.getenv("GITHUB_REPOSITORY"))
+MAX_ITER=8
+BR=f"agent-{os.urandom(4).hex()}"
 
-MAX_ITERATIONS = 8
-WORKING_BRANCH = f"agent-task-{os.urandom(4).hex()}"
-
-
-# --- Tools ---
-def run_command(cmd: str, cwd: str = ".") -> str:
+def run_command(c,w="."):
     try:
-        result = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=30)
-        return f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        r=subprocess.run(c,shell=True,cwd=w,capture_output=True,text=True,timeout=60)
+        return f"CMD:{c}\nOUT:{r.stdout}\nERR:{r.stderr}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return str(e)
 
+def read_file(p):
+    try:return Path(p).read_text(encoding="utf-8")
+    except Exception as e:return str(e)
 
-def read_file(path: str) -> str:
+def edit_file(p,o,n):
     try:
-        return Path(path).read_text(encoding="utf-8")
-    except Exception as e:
-        return f"Error reading {path}: {e}"
+        t=Path(p).read_text(encoding="utf-8")
+        if o not in t:return "not found"
+        Path(p).write_text(t.replace(o,n,1),encoding="utf-8")
+        return "edited"
+    except Exception as e:return str(e)
 
-
-def edit_file(path: str, old_str: str, new_str: str) -> str:
-    try:
-        content = Path(path).read_text(encoding="utf-8")
-        if old_str in content:
-            content = content.replace(old_str, new_str, 1)
-            Path(path).write_text(content, encoding="utf-8")
-            return f"✅ Successfully edited {path}"
-        return f"❌ Old string not found in {path}"
-    except Exception as e:
-        return f"❌ Edit failed: {e}"
-
-
-tool_functions = {
-    "run_command": run_command,
-    "read_file": read_file,
-    "edit_file": edit_file
+tools={
+    "run_command":run_command,
+    "read_file":read_file,
+    "edit_file":edit_file
 }
 
-
-# --- Tool Schemas (Corrected) ---
-tool_specs = [
-    {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": f"Call the {name} tool",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "arg": {"type": "string", "description": "Argument for the tool"}
-                },
-                "required": ["arg"]
-            }
-        }
-    }
-    for name in tool_functions.keys()
+specs=[
+    {"type":"function","function":{
+        "name":"run_command",
+        "parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string","default":"."}},"required":["command"]}
+    }},
+    {"type":"function","function":{
+        "name":"read_file",
+        "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+    }},
+    {"type":"function","function":{
+        "name":"edit_file",
+        "parameters":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}
+    }}
 ]
 
+def agent_loop(task):
+    msgs=[
+        {"role":"system","content":f"You modify {repo.full_name} safely. Always use a new branch and draft PR."},
+        {"role":"user","content":task}
+    ]
+    branched=False
 
-def agent_loop(task: str):
-    messages = [{
-        "role": "system",
-        "content": f"""You are an expert autonomous software engineer for {repo.full_name}.
-You must be careful, thorough, and safe. 
-- Always create changes on a new branch and open a **DRAFT PR**.
-- Never push directly to main.
-- Run tests before proposing changes.
-- Explain your reasoning clearly.""".strip()
-    },
-    {
-        "role": "user",
-        "content": f"Task: {task}"
-    }]
-
-    branch_created = False
-
-    for i in range(MAX_ITERATIONS):
-        print(f"\n🔄 Iteration {i+1}/{MAX_ITERATIONS}")
-
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=tool_specs,
-            tool_choice="auto",
-            temperature=0.3
-        )
-
-        msg = response.choices[0].message
-        messages.append({"role": "assistant", "content": msg.content, "tool_calls": msg.tool_calls})
-
-        if not msg.tool_calls:
-            print("✅ Agent finished reasoning.")
-            if msg.content:
-                print(msg.content)
+    for _ in range(MAX_ITER):
+        r=client.chat.completions.create(model="gpt-4o",messages=msgs,tools=specs,tool_choice="auto")
+        m=r.choices[0].message
+        msgs.append(m)
+        if not m.tool_calls:
+            print("DONE");print(m.content or "")
             break
 
-        # Execute tools
-        for tool_call in msg.tool_calls:
-            name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments or "{}")
-            arg = args.get("arg", "")
+        for call in m.tool_calls:
+            name=call.function.name
+            args=json.loads(call.function.arguments or "{}")
+            if name=="run_command":
+                res=run_command(args.get("command",""),args.get("cwd","."))
+                if not branched and args.get("command","").startswith("git "):
+                    run_command(f"git checkout -b {BR}")
+                    branched=True
+            elif name=="read_file":
+                res=read_file(args.get("path",""))
+            elif name=="edit_file":
+                if not branched:
+                    run_command(f"git checkout -b {BR}")
+                    branched=True
+                res=edit_file(args.get("path",""),args.get("old",""),args.get("new",""))
+            else:
+                res="unknown tool"
 
-            print(f"🔧 Calling {name}({arg[:80]}...)")
+            msgs.append({"role":"tool","tool_call_id":call.id,"content":str(res)})
 
-            result = tool_functions[name](arg)
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": str(result)
-            })
-
-            if not branch_created and "git" in arg.lower():
-                run_command(f"git checkout -b {WORKING_BRANCH}")
-                branch_created = True
-
-    # Final step: Create Draft PR if changes were made
-    if branch_created:
+    if branched:
         run_command("git add .")
-        run_command('git commit -m "🤖 Autonomous Agent changes" || echo "No changes to commit"')
-        run_command(f"git push origin {WORKING_BRANCH} || echo 'Push failed'")
+        run_command('git commit -m "agent changes" || echo nochange')
+        run_command(f"git push origin {BR} || echo pushfail")
+        pr=repo.create_pull(
+            title=f"🤖 Agent: {task[:60]}",
+            body=f"Task: {task}\nIterations:{MAX_ITER}",
+            head=BR,
+            base=repo.default_branch,
+            draft=True
+        )
+        print("PR:",pr.html_url)
 
-        try:
-            pr = repo.create_pull(
-                title=f"🤖 Agent: {task[:60]}...",
-                body=f"Autonomous changes.\n\nTask: {task}\n\nIterations: {MAX_ITERATIONS}",
-                head=WORKING_BRANCH,
-                base=repo.default_branch,
-                draft=True
-            )
-            print(f"✅ Draft PR created: {pr.html_url}")
-        except Exception as e:
-            print(f"PR creation failed: {e}")
-
-
-if __name__ == "__main__":
-    task = os.getenv("TASK", "Review repository and fix issues")
-    agent_loop(task)
+if __name__=="__main__":
+    agent_loop(os.getenv("TASK","Review repository"))
